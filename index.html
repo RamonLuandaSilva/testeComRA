@@ -12,8 +12,10 @@ box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:en
 html{scroll-padding-top:env(safe-area-inset-top,0px)}
 html,body{height:100%;margin:0;overflow:hidden;background:var(--bg);color:var(--ink);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none;display:block;z-index:1}
-.live{display:none}
-body.run .live{display:flex}
+video{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;display:none;z-index:0}
+body.cam video{display:block}
+.row.live{display:none}
+body.run .row.live{display:flex}
 body.run .idle{display:none}
 #ui{position:fixed;z-index:2;inset:0;pointer-events:none;display:flex;flex-direction:column;justify-content:space-between}
 #ui>*{pointer-events:auto}
@@ -37,10 +39,11 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 </style>
 </head>
 <body>
+<video id="video" playsinline muted autoplay></video>
 <div id="ui">
   <div id="top"><div id="verdict"><b id="v1"></b><small id="v2"></small><small id="v3"></small></div></div>
   <div id="bottom">
-    <div class="row idle"><button id="arBtn" class="primary">Iniciar RA no meu quarto</button></div>
+    <div class="row idle"><button id="camBtn" class="primary">RA com câmera (sem ARCore)</button><button id="arBtn">RA nativa (ARCore)</button></div>
     <div class="row">
       <button id="fitBtn">Ajustar mesa à cadeira</button>
       <button id="tranBtn">Tampo transparente</button>
@@ -56,11 +59,11 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 // ---------- Medidas (cm) ----------
-const P = {h:75, t:3, w:100, d:55, ah:70, cw:60, push:0, rot:0};
+const P = {h:75, t:3, w:100, d:55, ah:70, cw:60, push:0, rot:0, ch:130};
 const GROUPS = [
   ['Mesa', [['h','Altura do tampo',55,95,1],['t','Espessura do tampo',1,8,0.5],['w','Largura',50,180,5],['d','Profundidade',30,90,5]]],
   ['Cadeira (braços)', [['ah','Altura do braço',50,90,1],['cw','Largura total',40,80,1],['push','Empurrar p/ mesa',0,50,1]]],
-  ['Posição', [['rot','Girar a mesa',0,360,5]]]
+  ['Posição', [['rot','Girar a mesa',0,360,5],['ch','Altura do celular',90,180,5]]]
 ];
 const $ = id => document.getElementById(id);
 const ui = $('ui'), status = $('status');
@@ -182,16 +185,17 @@ cv.addEventListener('wheel', e=>{ if(mode!=='3d') return; orbit.dist = Math.max(
 let mode = '3d', hitSource = null, xrSession = null;
 const reticle = new THREE.Mesh(new THREE.RingGeometry(0.12,0.15,32).rotateX(-Math.PI/2), new THREE.MeshBasicMaterial({color:0xf2b705}));
 reticle.matrixAutoUpdate = false; reticle.visible = false; scene.add(reticle);
-function setMode(m){ mode = m; document.body.classList.toggle('run', m==='xr'); grid.visible = (m==='3d'); reticle.visible = false; }
-function backTo3D(){ setMode('3d'); root.visible = true; root.position.set(0,0,0); placeCamera(); }
+function setMode(m){ mode = m; document.body.classList.toggle('run', m!=='3d'); document.body.classList.toggle('cam', m==='cam'); grid.visible = (m==='3d'); reticle.visible = false; }
+function backTo3D(){ setMode('3d'); root.visible = true; root.position.set(0,0,0); camera.fov = 50; camera.updateProjectionMatrix(); placeCamera(); }
 
 async function checkAR(){
   let t;
-  if(!navigator.xr) t = 'Este navegador não tem WebXR. Abra esta página no Chrome do Android.';
+  if(location.protocol !== 'https:') t = 'Esta página foi aberta como ' + location.protocol + ' (arquivo local). A RA só funciona em um link https:// hospedado: publique o arquivo no GitHub Pages ou no Netlify.';
+  else if(!navigator.xr) t = 'Este navegador não tem WebXR. Abra esta página no Chrome do Android.';
   else{
     const ok = await navigator.xr.isSessionSupported('immersive-ar').catch(()=>false);
-    t = ok ? 'Pronto: toque em "Iniciar RA", aponte para o chão e toque para colocar a mesa.'
-           : 'RA indisponível: instale ou atualize "Serviços do Google Play para RA" na Play Store e use o Chrome.';
+    t = ok ? 'ARCore disponível: use "RA nativa" ou "RA com câmera".'
+           : 'RA nativa (ARCore) indisponível neste aparelho. Use "RA com câmera".';
   }
   if(window.top !== window.self) t += ' Esta página está dentro de um quadro (claude.ai), que pode bloquear a RA. Se falhar, hospede o arquivo fora dele.';
   status.textContent = t;
@@ -213,10 +217,55 @@ $('arBtn').onclick = async ()=>{
     xrSession.addEventListener('end', ()=>{ hitSource = null; xrSession = null; backTo3D(); status.textContent = 'RA encerrada.'; });
   }catch(err){
     xrSession = null;
-    status.textContent = 'Não foi possível iniciar a RA: ' + err.message + '. Use o Chrome do Android com "Serviços do Google Play para RA"; se a página estiver no claude.ai, hospede-a fora dele.';
+    status.textContent = 'Não foi possível iniciar a RA: ' + err.message + '. Se o aparelho não tem ARCore, use "RA com câmera".';
   }
 };
-$('exitBtn').onclick = ()=>{ if(xrSession) xrSession.end(); };
+$('exitBtn').onclick = ()=>{ if(xrSession) xrSession.end(); else stopCam(); };
+
+// --- Modo câmera (aparelhos sem ARCore): vídeo da câmera ao fundo + giroscópio move a câmera virtual.
+// Só acompanha a rotação do celular (não o deslocamento); o chão é estimado pela altura do celular.
+const video = $('video'), cam = {stream:null, a:0, b:0, g:0, has:false};
+const onOrient = e=>{ if(e.alpha==null) return; cam.a=e.alpha; cam.b=e.beta; cam.g=e.gamma; cam.has=true; };
+$('camBtn').onclick = async ()=>{
+  try{
+    const DOE = window.DeviceOrientationEvent;
+    if(DOE && typeof DOE.requestPermission === 'function' && await DOE.requestPermission() !== 'granted')
+      throw new Error('permissão do sensor de movimento negada');
+    cam.stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}}, audio:false});
+    video.srcObject = cam.stream; await video.play();
+    cam.has = false; addEventListener('deviceorientation', onOrient);
+    camera.fov = 62; camera.updateProjectionMatrix();
+    setMode('cam'); root.visible = false;
+    status.textContent = 'Segure o celular na altura configurada, aponte para o chão até o anel amarelo aparecer e toque na tela para fixar a mesa.';
+    setTimeout(()=>{ if(mode==='cam' && !cam.has) status.textContent = 'Sem dados do sensor de movimento. Verifique as permissões do site no Chrome.'; }, 2500);
+  }catch(err){
+    status.textContent = 'Não foi possível abrir a câmera: ' + err.message + '. Permita câmera e sensores de movimento para este site no Chrome.';
+  }
+};
+function stopCam(){
+  removeEventListener('deviceorientation', onOrient);
+  if(cam.stream) cam.stream.getTracks().forEach(t=>t.stop());
+  cam.stream = null; video.srcObject = null; backTo3D(); status.textContent = 'RA encerrada.';
+}
+const zee = new THREE.Vector3(0,0,1), eul = new THREE.Euler(), q0 = new THREE.Quaternion(), q1 = new THREE.Quaternion(-Math.sqrt(.5),0,0,Math.sqrt(.5));
+const ray = new THREE.Raycaster(), floor = new THREE.Plane(new THREE.Vector3(0,1,0),0), hitPt = new THREE.Vector3();
+function updateCam(){
+  const r = THREE.MathUtils.degToRad, scr = r((screen.orientation && screen.orientation.angle) || window.orientation || 0);
+  eul.set(r(cam.b), r(cam.a), -r(cam.g), 'YXZ');
+  camera.quaternion.setFromEuler(eul).multiply(q1).multiply(q0.setFromAxisAngle(zee, -scr));
+  camera.position.set(0, P.ch/100, 0); camera.updateMatrixWorld();
+  ray.setFromCamera({x:0,y:0}, camera);              // raio do centro da tela até o chão (y = 0)
+  const hit = ray.ray.intersectPlane(floor, hitPt);
+  reticle.visible = !!hit && hitPt.length() < 6;
+  if(reticle.visible) reticle.matrix.makeTranslation(hitPt.x, 0, hitPt.z);
+}
+let downAt = null;                                   // toque sem arrastar fixa a mesa no anel
+cv.addEventListener('pointerdown', e=>{ downAt = {x:e.clientX, y:e.clientY}; });
+cv.addEventListener('pointerup', e=>{
+  if(mode==='cam' && reticle.visible && downAt && Math.hypot(e.clientX-downAt.x, e.clientY-downAt.y) < 10){
+    root.position.set(hitPt.x, 0, hitPt.z); root.visible = true;
+  }
+});
 
 let ghost = false;                                   // tampo translúcido: deixa ver os braços da cadeira real através da mesa
 $('tranBtn').onclick = ()=>{
@@ -232,7 +281,7 @@ renderer.setAnimationLoop((ts, frame)=>{
       const pose = hits[0].getPose(renderer.xr.getReferenceSpace());
       reticle.visible = true; reticle.matrix.fromArray(pose.transform.matrix);
     } else reticle.visible = false;
-  }
+  } else if(mode==='cam' && cam.has) updateCam();
   renderer.render(scene, camera);
 });
 addEventListener('resize', ()=>{
